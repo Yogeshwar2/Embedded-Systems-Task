@@ -1,0 +1,257 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+
+// WiFi credentials
+const char* ssid = "Rover";
+const char* password = "123456789";
+
+// Pin definitions for L298N motor driver
+const int motor1In1Pin = 2;
+const int motor1In2Pin = 4;
+const int motor2In1Pin = 19;
+const int motor2In2Pin = 21;
+
+// PWM pins for motor speed control
+const int pwmPin1 = 15;  // Motor 1 speed control
+const int pwmPin2 = 18;  // Motor 2 speed control
+
+// Ultrasonic sensor pin definitions
+const int trigPin = 22;
+const int echoPin = 23;
+
+// Default speed
+int pwmValue = 255; // Max speed by default
+String currentDirection = "stop"; // Track current direction
+bool isMoving = false; // Flag to track if the vehicle is moving
+
+// HTML page content
+const char* htmlPage = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    .arrows {
+      font-size: 70px;
+      color: black;
+      position: center;
+    }
+    .stopButton {
+      font-size: 25px;
+      position: center;
+      color: black;
+    }
+    .button {
+      width: 100px;
+      height: 100px;
+      font-size: 20px;
+      margin: 10px;
+      border-radius: 25%;
+    }
+    .distance {
+      color: lightgreen;
+      font-size: 30px;
+      text-align: center;
+      margin-bottom: 10px;
+    }
+    .obstacle {
+      color: red;
+      font-size: 34px;
+      text-align: center;
+      margin-top: 20px;
+    }
+    .slider {
+      width: 200px;
+      margin-top: 20px;
+    }
+    .sliderText {
+      color: white;
+      font-size: 20px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body class="noselect" align="center" style="background-color:black">
+  <h1 style="color: white; text-align: center;">Control Your Car!!</h1>
+  <p class="distance">Distance: <span id="distance">-</span></p>
+  <p class="obstacle" id="obstacleText" style="display: none;">Obstacle Detected</p>
+  
+  <button class="button" onclick="move('forward')"><span class="arrows">&#8679;</span></button>
+  <br>
+  <button class="button" onclick="move('left')"><span class="arrows">&#8678;</span></button>
+  <button class="button" onclick="move('stop')"><span class="stopButton">STOP</span></button>
+  <button class="button" onclick="move('right')"><span class="arrows">&#8680;</span></button>
+  <br>
+  <button class="button" onclick="move('backward')"><span class="arrows">&#8681;</span></button>
+
+  <div class="sliderText">Adjust Speed:</div>
+  <input type="range" min="0" max="255" value="255" class="slider" id="speedSlider" oninput="updateSpeed(this.value)">
+  <p class="sliderText">Current Speed: <span id="currentSpeed">255</span></p>
+
+  <p style="color: white; text-align: center; font-size: 30px;">Yogeshwar.jb (Reg. No. 21BEC0521)</p>
+  <p style="color: white; text-align: center; font-size: 30px;">S K Thinagaran (Reg. No. 21BEC2136)</p>
+  <p style="color: white; text-align: center; font-size: 30px;">Nithish Kumar C(Reg. No. 21BEC2155)</p>
+
+  <script>
+    var currentSpeed = 255; // Default speed
+
+    function updateSpeed(value) {
+      currentSpeed = value;
+      document.getElementById("currentSpeed").innerText = value;
+    }
+
+    function move(direction) {
+      var xhttp = new XMLHttpRequest();
+      xhttp.open("GET", "/move?dir=" + direction + "&speed=" + currentSpeed, true);
+      xhttp.send();
+    }
+
+    function updateDistance(distance) {
+      var distanceElement = document.getElementById("distance");
+      var obstacleTextElement = document.getElementById("obstacleText");
+
+      distanceElement.textContent = distance + " cm";
+
+      if (distance < 10) {
+        obstacleTextElement.style.display = "block";
+      } else {
+        obstacleTextElement.style.display = "none";
+      }
+    }
+
+    setInterval(function() {
+      var xhttp = new XMLHttpRequest();
+      xhttp.onreadystatechange = function() {
+        if (this.readyState == 4 && this.status == 200) {
+          var distance = parseInt(this.responseText);
+          updateDistance(distance);
+        }
+      };
+      xhttp.open("GET", "/getDistance", true);
+      xhttp.send();
+    }, 1000);
+  </script>
+</body>
+</html>
+)HTML";
+
+AsyncWebServer server(80);
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+
+  pinMode(motor1In1Pin, OUTPUT);
+  pinMode(motor1In2Pin, OUTPUT);
+  pinMode(motor2In1Pin, OUTPUT);
+  pinMode(motor2In2Pin, OUTPUT);
+  pinMode(pwmPin1, OUTPUT);
+  pinMode(pwmPin2, OUTPUT);
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/html", htmlPage);
+  });
+
+  server.on("/move", HTTP_GET, [](AsyncWebServerRequest *request){
+    currentDirection = request->getParam("dir")->value();
+    pwmValue = request->getParam("speed")->value().toInt(); // Fetching slider value
+
+    if (currentDirection != "stop") {
+      isMoving = true;
+      long distance = getDistance();
+      if (distance >= 10) {
+        moveInDirection(currentDirection, pwmValue);
+        request->send(200, "text/plain", "Moving: " + currentDirection + " at speed: " + String(pwmValue));
+      } else {
+        stopMotors();
+        request->send(200, "text/plain", "Obstacle detected! Vehicle stopped.");
+      }
+    } else {
+      isMoving = false;
+      stopMotors();
+      request->send(200, "text/plain", "Stopped");
+    }
+  });
+
+  server.on("/getDistance", HTTP_GET, [](AsyncWebServerRequest *request){
+    long distance = getDistance();
+    request->send(200, "text/plain", String(distance));
+  });
+
+  server.begin();
+  Serial.println("Server started");
+}
+
+void loop() {
+  if (isMoving) {
+    long distance = getDistance();
+    if (distance < 10) {
+      stopMotors();
+      Serial.println("Obstacle detected! Stopping vehicle.");
+      isMoving = false; // Stop movement when obstacle detected
+    }
+  }
+}
+
+// Function to move in the specified direction
+void moveInDirection(String direction, int speed) {
+  controlMotorSpeed(speed); // Set PWM speed
+
+  if (direction == "forward") {
+    digitalWrite(motor1In1Pin, HIGH);
+    digitalWrite(motor1In2Pin, LOW);
+    digitalWrite(motor2In1Pin, HIGH);
+    digitalWrite(motor2In2Pin, LOW);
+    Serial.print("Moving forward at speed ");
+  } else if (direction == "backward") {
+    digitalWrite(motor1In1Pin, LOW);
+    digitalWrite(motor1In2Pin, HIGH);
+    digitalWrite(motor2In1Pin, LOW);
+    digitalWrite(motor2In2Pin, HIGH);
+    Serial.print("Moving backward at speed ");
+  } else if (direction == "left") {
+    digitalWrite(motor1In1Pin, LOW);
+    digitalWrite(motor1In2Pin, HIGH);
+    digitalWrite(motor2In1Pin, HIGH);
+    digitalWrite(motor2In2Pin, LOW);
+    Serial.print("Turning left at speed ");
+  } else if (direction == "right") {
+    digitalWrite(motor1In1Pin, HIGH);
+    digitalWrite(motor1In2Pin, LOW);
+    digitalWrite(motor2In1Pin, LOW);
+    digitalWrite(motor2In2Pin, HIGH);
+    Serial.print("Turning right at speed ");
+  }
+  Serial.println(speed);
+}
+
+void stopMotors() {
+  digitalWrite(motor1In1Pin, LOW);
+  digitalWrite(motor1In2Pin, LOW);
+  digitalWrite(motor2In1Pin, LOW);
+  digitalWrite(motor2In2Pin, LOW);
+  analogWrite(pwmPin1, 0);
+  analogWrite(pwmPin2, 0);
+}
+
+void controlMotorSpeed(int speed) {
+  analogWrite(pwmPin1, speed);
+  analogWrite(pwmPin2, speed);
+}
+
+long getDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH);
+  long distance = duration * 0.034 / 2;  // Convert duration to distance
+  return distance;
+}
